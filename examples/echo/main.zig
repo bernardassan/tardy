@@ -18,8 +18,8 @@ fn echo_frame(rt: *Runtime, server: *const Socket) !void {
     const socket = try server.accept(rt);
     defer socket.close_blocking();
 
-    const reader = socket.reader(rt);
-    const writer = socket.writer(rt);
+    var reader = socket.reader(rt, &.{});
+    var writer = socket.writer(rt, &.{});
 
     log.debug(
         "{d} - accepted socket [{f}]",
@@ -31,12 +31,12 @@ fn echo_frame(rt: *Runtime, server: *const Socket) !void {
 
     var buffer: [1024]u8 = undefined;
     while (true) {
-        const recv_length = reader.read(&buffer) catch |e| {
+        const recv_length = reader.interface.readSliceShort(&buffer) catch |e| {
             log.err("Failed to recv on socket | {}", .{e});
             return;
         };
 
-        writer.writeAll(buffer[0..recv_length]) catch |e| {
+        writer.interface.writeAll(buffer[0..recv_length]) catch |e| {
             log.err("Failed to send on socket | {}", .{e});
             return;
         };

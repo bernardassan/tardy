@@ -37,6 +37,9 @@ fn stream_frame(rt: *Runtime, server: *const Socket, file_name: [:0]const u8) !v
     );
 
     var buffer: [1024]u8 = undefined;
+
+    var reader=file.reader(rt, &.{});
+    reader.stream()
     try Stream.copy(rt, file.stream(), socket.stream(), &buffer);
 }
 

@@ -292,45 +292,155 @@ pub const Socket = struct {
         return length;
     }
 
-    const ReadWriteContext = struct { socket: Socket, rt: *Runtime };
+    pub const Writer = struct {
+        socket: Socket,
+        err: ?anyerror = null,
+        pos: u64 = 0,
+        rt: *Runtime,
+        interface: std.Io.Writer,
 
-    const Writer = std.io.GenericWriter(ReadWriteContext, anyerror, struct {
-        fn write(ctx: ReadWriteContext, bytes: []const u8) !usize {
-            return try ctx.socket.send(ctx.rt, bytes);
+        pub fn init(socket: Socket, rt: *Runtime, buffer: []u8) Writer {
+            return .{
+                .socket = socket,
+                .rt = rt,
+                .interface = initInterface(buffer),
+            };
         }
-    }.write);
 
-    const Reader = std.io.GenericReader(ReadWriteContext, anyerror, struct {
-        fn read(ctx: ReadWriteContext, buffer: []u8) !usize {
-            return try ctx.socket.recv(ctx.rt, buffer);
+        pub fn initInterface(buffer: []u8) std.Io.Writer {
+            return .{
+                .vtable = &.{
+                    .drain = drain,
+                    .sendFile = sendFile,
+                },
+                .buffer = buffer,
+            };
         }
-    }.read);
 
-    pub fn writer(self: Socket, rt: *Runtime) Writer {
-        return Writer{ .context = .{ .socket = self, .rt = rt } };
+        pub fn drain(io_w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+            const w: *Writer = @alignCast(@fieldParentPtr("interface", io_w));
+            const buffered = io_w.buffered();
+
+            if (buffered.len != 0) {
+                const n = w.socket.send(w.rt, buffered) catch |err| {
+                    w.err = err;
+                    return error.WriteFailed;
+                };
+                w.pos += n;
+                return io_w.consume(n);
+            }
+            for (data[0 .. data.len - 1]) |buf| {
+                if (buf.len == 0) continue;
+                const n = w.socket.send(w.rt, buffered) catch |err| {
+                    w.err = err;
+                    return error.WriteFailed;
+                };
+                w.pos += n;
+                return io_w.consume(n);
+            }
+            const pattern = data[data.len - 1];
+            if (pattern.len == 0 or splat == 0) return 0;
+            const n = w.socket.send(w.rt, buffered) catch |err| {
+                w.err = err;
+                return error.WriteFailed;
+            };
+            w.pos += n;
+            return io_w.consume(n);
+        }
+
+        pub fn sendFile(
+            io_w: *std.Io.Writer,
+            file_reader: *std.fs.File.Reader,
+            limit: std.Io.Limit,
+        ) std.Io.Writer.FileError!usize {
+            _ = io_w; // autofix
+            _ = file_reader; // autofix
+            _ = limit; // autofix
+            return error.Unimplemented;
+        }
+    };
+
+    pub const Reader = struct {
+        socket: Socket,
+        rt: *Runtime,
+        err: ?anyerror = null,
+        interface: std.Io.Reader,
+        /// Tracks the true seek position in the file. To obtain the logical
+        /// position, use `logicalPos`.
+        pos: u64 = 0,
+
+        pub fn init(socket: Socket, rt: *Runtime, buffer: []u8) Reader {
+            return .{
+                .socket = socket,
+                .rt = rt,
+                .interface = initInterface(buffer),
+            };
+        }
+
+        pub fn initInterface(buffer: []u8) std.Io.Reader {
+            return .{
+                .vtable = &.{
+                    .stream = Reader.stream,
+                    // .discard = discard,
+                    // .readVec = readVec,
+                },
+                .buffer = buffer,
+                .seek = 0,
+                .end = 0,
+            };
+        }
+
+        fn stream(io_reader: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+            _ = limit; // autofix
+            const r: *Reader = @alignCast(@fieldParentPtr("interface", io_reader));
+            const n = r.socket.recv(r.rt, w.buffer) catch |err| {
+                r.err = err;
+                return error.ReadFailed;
+            };
+            if (n == 0) {
+                return error.EndOfStream;
+            }
+            r.pos += n;
+            return n;
+        }
+
+        fn readVec(io_reader: *std.Io.Reader, data: [][]u8) std.Io.Reader.Error!usize {
+            _ = io_reader; // autofix
+            _ = data; // autofix
+        }
+
+        fn discard(io_reader: *std.Io.Reader, limit: std.Io.Limit) std.Io.Reader.Error!usize {
+            _ = io_reader; // autofix
+            _ = limit; // autofix
+        }
+    };
+
+    pub fn writer(sock: Socket, rt: *Runtime, buffer: []u8) Writer {
+        return .init(sock, rt, buffer);
     }
 
-    pub fn reader(self: Socket, rt: *Runtime) Reader {
-        return Reader{ .context = .{ .socket = self, .rt = rt } };
+    pub fn reader(sock: Socket, rt: *Runtime, buffer: []u8) Reader {
+        return .init(sock, rt, buffer);
     }
 
-    pub fn stream(self: *const Socket) Stream {
-        return Stream{
-            .inner = @constCast(@ptrCast(self)),
-            .vtable = .{
-                .read = struct {
-                    fn read(inner: *anyopaque, rt: *Runtime, buffer: []u8) !usize {
-                        const socket: *Socket = @ptrCast(@alignCast(inner));
-                        return try socket.recv(rt, buffer);
-                    }
-                }.read,
-                .write = struct {
-                    fn write(inner: *anyopaque, rt: *Runtime, buffer: []const u8) !usize {
-                        const socket: *Socket = @ptrCast(@alignCast(inner));
-                        return try socket.send(rt, buffer);
-                    }
-                }.write,
-            },
-        };
-    }
+    // TODO: to be remove to use new Io API
+    // pub fn stream(self: *const Socket) Stream {
+    //     return Stream{
+    //         .inner = @ptrCast(@constCast(self)),
+    //         .vtable = .{
+    //             .read = struct {
+    //                 fn read(inner: *anyopaque, rt: *Runtime, buffer: []u8) !usize {
+    //                     const socket: *Socket = @ptrCast(@alignCast(inner));
+    //                     return try socket.recv(rt, buffer);
+    //                 }
+    //             }.read,
+    //             .write = struct {
+    //                 fn write(inner: *anyopaque, rt: *Runtime, buffer: []const u8) !usize {
+    //                     const socket: *Socket = @ptrCast(@alignCast(inner));
+    //                     return try socket.send(rt, buffer);
+    //                 }
+    //             }.write,
+    //         },
+    //     };
+    // }
 };

@@ -26,7 +26,7 @@ const log = std.log.scoped(.@"tardy/fs/file");
 
 pub const Writer = struct {
     file: File,
-    err: ?error{} = null,
+    err: ?anyerror = null,
     mode: enum { positional, streaming } = .positional,
     pos: u64 = 0,
     rt: *Runtime,
@@ -113,17 +113,24 @@ pub const Writer = struct {
 
     pub fn sendFile(
         io_w: *std.Io.Writer,
-        file_reader: *Reader,
+        file_reader: *std.fs.File.Reader,
         limit: std.Io.Limit,
     ) std.Io.Writer.FileError!usize {
         _ = io_w; // autofix
         _ = file_reader; // autofix
         _ = limit; // autofix
+        return error.Unimplemented;
     }
 };
 
 pub const Reader = struct {
     file: File,
+    err: ?anyerror = null,
+    size: ?u64 = null,
+    mode: enum { positional, streaming } = .positional,
+    /// Tracks the true seek position in the file. To obtain the logical
+    /// position, use `logicalPos`.
+    pos: u64 = 0,
     rt: *Runtime,
     interface: std.Io.Reader,
 
@@ -139,8 +146,8 @@ pub const Reader = struct {
         return .{
             .vtable = &.{
                 .stream = stream,
-                .discard = discard,
-                .readVec = readVec,
+                // .discard = discard,
+                // .readVec = readVec,
             },
             .buffer = buffer,
             .seek = 0,
@@ -149,8 +156,33 @@ pub const Reader = struct {
     }
 
     fn stream(io_reader: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
-        _ = io_reader; // autofix
-        _ = w; // autofix
+        const r: *Reader = @alignCast(@fieldParentPtr("interface", io_reader));
+        switch (r.mode) {
+            .positional => {
+                const n = r.file.read(r.rt, w.buffer, r.pos) catch |err| {
+                    r.err = err;
+                    return error.ReadFailed;
+                };
+                if (n == 0) {
+                    r.size = r.pos;
+                    return error.EndOfStream;
+                }
+                r.pos += n;
+                return n;
+            },
+            .streaming => {
+                const n = r.file.read(r.rt, w.buffer, null) catch |err| {
+                    r.err = err;
+                    return error.ReadFailed;
+                };
+                if (n == 0) {
+                    r.size = r.pos;
+                    return error.EndOfStream;
+                }
+                r.pos += n;
+                return n;
+            },
+        }
         _ = limit; // autofix
     }
 
@@ -167,15 +199,6 @@ pub const Reader = struct {
 
 pub const File = packed struct {
     handle: std.posix.fd_t,
-
-    const Reader = std.io.GenericReader(ReadWriteContext, anyerror, struct {
-        fn read(ctx: ReadWriteContext, buffer: []u8) !usize {
-            return ctx.file.read(ctx.rt, buffer, null) catch |e| switch (e) {
-                error.EndOfFile => 0,
-                else => return e,
-            };
-        }
-    }.read);
 
     pub fn reader(file: File, rt: *Runtime, buffer: []u8) Reader {
         return .init(file, rt, buffer);
@@ -582,7 +605,7 @@ pub const File = packed struct {
                 };
             };
 
-            return Stat{
+            return .{
                 .size = file_stat.size,
                 .mode = file_stat.mode,
                 .changed = .{
@@ -601,8 +624,9 @@ pub const File = packed struct {
         }
     }
 
-    pub fn stream(self: *const File) Stream {
-        return Stream{
+    // TODO: to be remove to use new Io API
+    pub fn stream(self: File) Stream {
+        return .{
             .inner = @ptrCast(@constCast(self)),
             .vtable = .{
                 .read = struct {
